@@ -9,67 +9,123 @@ module Terraform
       def available?
         return @available if defined?(@available)
 
-        response = terraform_runner_client.get('api/ping')
-        @available = response.status == 200
+        response = terraform_runner_client.get('ready')
+        @available = response.status == 200 && JSON.parse(response.body)['status'] == 'UP'
       rescue
         @available = false
       end
 
-      # Run a template, initiates terraform-runner job for running a template, via terraform-runner api
+      # Run TerraformRunner Stack actions with a Terraform template.
       #
-      # @param input_vars [Hash] Hash with key/value pairs that will be passed as input variables to the
-      #        terraform-runner run
-      # @param template_path [String] Path to the template we will want to run
-      # @param tags [Hash] Hash with key/values pairs that will be passed as tags to the terraform-runner run
-      # @param credentials [Array] List of Authentication object ids to provide to the terraform run
-      # @param env_vars [Hash] Hash with key/value pairs that will be passed as environment variables to the
-      #        terraform-runner run
-      # @return [Terraform::Runner::ResponseAsync] Response object of terraform-runner create action
-      def run_async(input_vars, template_path, tags: nil, credentials: [], env_vars: {})
-        _log.debug("Run_aysnc template: #{template_path}")
-        response = create_stack_job(
-          template_path,
-          :input_vars  => input_vars,
-          :tags        => tags,
-          :credentials => credentials,
-          :env_vars    => env_vars
+      # @param action_type   [String] (required) a action to run, use one of Terraform::Runner::ActionType::<constant>
+      # @param template_path [String] (required) path to the terraform template directory.
+      # @param options       [Hash]   (optional) key/values pairs
+      #
+      # @return [Terraform::Runner::ResponseAsync] Response object of terraform-runner api call
+      #
+      # Note:
+      # * supported in 'action_type' :
+      #   1. ActionType::CREATE   (Provision)   create new stack - `terraform apply`.
+      #   2. ActionType::UPDATE   (Reconfigure) update a existing stack - `terraform apply`.
+      #   3. ActionType::DELETE   (Retirement)  destroy a existing stack/resources - `terraform destroy`.
+      #   4. ActionType::RETRIEVE (Fetch)       fetch a existing stack object json from terraform-runner.
+      #   5. ActionType::CANCEL   (Stop)        stop running stack job in terraform-runner.
+      # * keys allowed in ':options'
+      #   - :input_vars                  [Hash]   (optional) key/value pairs, as input variables for the terraform-runner run job.
+      #   - :input_vars_type_constraints [Hash]   (optional) key/value(type constraints object, from Terraform Runner) pairs.
+      #   - :tags                        [Hash]   (optional) key/value pairs tags for terraform-runner Provisioned resources.
+      #   - :credentials                 [Array]  (optional) list of authentication objects for the terraform run job.
+      #   - :env_vars                    [Hash]   (optional) key/value pairs, used as environment variables, for terraform-runner run job.
+      #   - :name                        [String] (optional) name for new created stack in terraform-runner.
+      #   - :stack_id                    [String] [required] if Reconfigure/Retire/Retrieve/Cancel actions.
+      #
+      def run(action_type, template_path, options = {})
+        raise "Not supported action type in this method, instead use method parse_terraform_variables" if action_type == ActionType::TEMPLATE_VARIABLES
+        raise "Not supported action type '#{action_type}'" unless ActionType.actions.include?(action_type)
+
+        response = run_terraform_runner_stack_api(
+          Request.new(
+            action_type,
+            options.merge(
+              :template_path => template_path,
+              :tenant_id     => stack_tenant_id
+            )
+          )
         )
-        Terraform::Runner::ResponseAsync.new(response.stack_id)
+
+        Terraform::Runner::ResponseAsync.new(response.stack_id, response.stack_job_id)
       end
 
-      # To simplify clients who may just call run, we alias it to call
-      # run_async.  If we ever need run_sync, we'll need to revisit this.
-      alias run run_async
-
-      # Stop running terraform-runner job by stack_id
+      # Stop/Cancel running terraform-runner job, by stack_id
       #
-      # @param stack_id [String] stack_id from the terraforn-runner job
+      # @param stack_id     [String] (required) stack_id from the terraforn-runner job
+      # @param stack_job_id [String] (optional) if not provided fetches latest job, else particular job of terraforn-runner stack object
       #
       # @return [Terraform::Runner::Response] Response object with result of terraform run
-      def stop_async(stack_id)
-        cancel_stack_job(stack_id)
+      def stop_async(stack_id, stack_job_id = nil)
+        run_terraform_runner_stack_api(
+          Request.new(
+            ActionType::CANCEL,
+            {
+              :stack_id     => stack_id,
+              :stack_job_id => stack_job_id,
+              :tenant_id    => stack_tenant_id
+            }
+          )
+        )
       end
 
-      # Fetch terraform-runner job result/status by stack_id
+      # To simplify clients who want to stop a running stack job, we alias it to call stop_async
+      alias stop stop_async
+
+      # Fetch/Retrieve stack object(with result/status), by stack_id from terraform-runner
       #
-      # @param stack_id [String] stack_id from the terraforn-runner job
+      # @param stack_id     [String] (required) stack_id of terraforn-runner stack object
+      # @param stack_job_id [String] (optional) if not provided fetches latest job, else particular job of terraforn-runner stack object
       #
       # @return [Terraform::Runner::Response] Response object with result of terraform run
-      def fetch_result_by_stack_id(stack_id)
-        retrieve_stack_job(stack_id)
+      def retrieve_stack(stack_id, stack_job_id = nil)
+        run_terraform_runner_stack_api(
+          Request.new(
+            ActionType::RETRIEVE,
+            {
+              :stack_id     => stack_id,
+              :stack_job_id => stack_job_id,
+              :tenant_id    => stack_tenant_id
+            }
+          )
+        )
       end
 
-      # =================================================
-      # TerraformRunner Stack-API interaction methods
-      # =================================================
+      # To simplify clients who want to fetch stack object from terraform-runner
+      alias stack retrieve_stack
+
+      # Parse Terraform Template input/output variables
+      #
+      # @param template_path [String] Path to the template we will want to parse for input/output variables
+      # @return Response(body) object of terraform-runner api/template/variables,
+      #         - the response object had template_input_params, template_output_params and terraform_version
+      def parse_template_variables(template_path)
+        request = Request.new(ActionType::TEMPLATE_VARIABLES, {:template_path => template_path})
+        action_endpoint = ActionType.action_endpoint(ActionType::TEMPLATE_VARIABLES)
+
+        http_response = terraform_runner_client.post(
+          action_endpoint,
+          *request.build_json_post_arguments
+        )
+
+        $embedded_terraform_log.debug("==== http_response.body: \n #{http_response.body}")
+        JSON.parse(http_response.body)
+      end
+
       private
 
       def server_url
-        ENV.fetch('TERRAFORM_RUNNER_URL', 'https://opentofu-runner:27000')
+        ENV.fetch('TERRAFORM_RUNNER_URL', 'https://opentofu-runner:6000')
       end
 
       def server_token
-        ENV.fetch('TERRAFORM_RUNNER_TOKEN', nil)
+        @server_token ||= ENV.fetch('TERRAFORM_RUNNER_TOKEN', jwt_token)
       end
 
       def stack_job_interval_in_secs
@@ -78,22 +134,6 @@ module Terraform
 
       def stack_job_max_time_in_secs
         ENV.fetch('TERRAFORM_RUNNER_STACK_JOB_MAX_TIME', 120).to_i
-      end
-
-      # Create to paramaters as used by terraform-runner api
-      #
-      # @param vars [Hash] Hash with key/value pairs that will be passed as input variables to the
-      #        terraform-runner run
-      # @return [Array] Array of {:name,:value}
-      def convert_to_cam_parameters(vars)
-        return [] if vars.nil?
-
-        vars.map do |key, value|
-          {
-            :name  => key,
-            :value => value
-          }
-        end
       end
 
       # create http client for terraform-runner rest-api
@@ -115,78 +155,36 @@ module Terraform
         '00000000-0000-0000-0000-000000000000'.freeze
       end
 
-      def json_post_arguments(payload)
-        return JSON.generate(payload), "Content-Type" => "application/json".freeze
-      end
-
-      # Create TerraformRunner Stack Job
-      def create_stack_job(
-        template_path,
-        input_vars: [],
-        tags: nil,
-        credentials: [],
-        env_vars: {},
-        name: "stack-#{rand(36**8).to_s(36)}"
-      )
-        _log.info("start stack_job for template: #{template_path}")
-        tenant_id = stack_tenant_id
-        encoded_zip_file = encoded_zip_from_directory(template_path)
-
-        # TODO: use tags,env_vars
-        payload = {
-          :cloud_providers => credentials,
-          :name            => name,
-          :tenantId        => tenant_id,
-          :templateZipFile => encoded_zip_file,
-          :parameters      => convert_to_cam_parameters(input_vars)
-        }
-        # _log.debug("Payload:>\n, #{payload}")
+      def run_terraform_runner_stack_api(request)
+        action_endpoint = ActionType.action_endpoint(request.action_type)
 
         http_response = terraform_runner_client.post(
-          "api/stack/create",
-          *json_post_arguments(payload)
+          action_endpoint,
+          *request.build_json_post_arguments
         )
-        _log.debug("==== http_response.body: \n #{http_response.body}")
-        _log.info("stack_job for template: #{template_path} running ...")
-        Terraform::Runner::Response.parsed_response(http_response)
-      end
 
-      # Retrieve TerraformRunner Stack Job details
-      def retrieve_stack_job(stack_id)
-        http_response = terraform_runner_client.post(
-          "api/stack/retrieve",
-          *json_post_arguments({:stack_id => stack_id})
-        )
-        _log.info("==== Retrieve Stack Response: \n #{http_response.body}")
-        Terraform::Runner::Response.parsed_response(http_response)
-      end
-
-      # Cancel/Stop running TerraformRunner Stack Job
-      def cancel_stack_job(stack_id)
-        http_response = terraform_runner_client.post(
-          "api/stack/cancel",
-          *json_post_arguments({:stack_id => stack_id})
-        )
-        _log.info("==== Cancel Stack Response: \n #{http_response.body}")
-        Terraform::Runner::Response.parsed_response(http_response)
-      end
-
-      # encode zip of a template directory
-      def encoded_zip_from_directory(template_path)
-        dir_path = template_path # directory to be zipped
-        dir_path = path[0...-1] if dir_path.end_with?('/')
-
-        Tempfile.create(%w[opentofu-runner-payload .zip]) do |zip_file_path|
-          _log.debug("Create #{zip_file_path}")
-          Zip::File.open(zip_file_path, Zip::File::CREATE) do |zipfile|
-            Dir.chdir(dir_path)
-            Dir.glob("**/*").select { |fn| File.file?(fn) }.each do |file|
-              _log.debug("Adding #{file}")
-              zipfile.add(file.sub("#{dir_path}/", ''), file)
-            end
-          end
-          Base64.encode64(File.binread(zip_file_path))
+        if request.action_type == ActionType::CREATE
+          $embedded_terraform_log.info("terraform-runnner #{action_endpoint} for #{request.options["name"]} is running ...")
+        else
+          $embedded_terraform_log.info("terraform-runnner #{action_endpoint} for #{request.options["name"]}/#{request.options["stack_id"]}/#{request.options["stack_job_id"]} is running ...")
         end
+
+        $embedded_terraform_log.debug("==== http_response.body: \n #{http_response.body}")
+
+        Terraform::Runner::Response.parsed_response(http_response).tap do |resp|
+          $embedded_terraform_log.info("terraform-runnner[#{action_endpoint}] stack/#{resp.stack_id}/#{resp.stack_job_id}")
+        end
+      end
+
+      def jwt_token
+        require "jwt"
+
+        payload = {'Username' => 'opentofu-runner'}
+        JWT.encode(payload, v2_key.key, 'HS256')
+      end
+
+      def v2_key
+        ManageIQ::Password.key
       end
     end
   end
